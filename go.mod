@@ -1,39 +1,39 @@
 module github.com/zhenghaoz/gorse
 
-go 1.23.2
-
-toolchain go1.23.3
+go 1.23.4
 
 require (
-	github.com/ReneKroon/ttlcache/v2 v2.11.0
 	github.com/XSAM/otelsql v0.35.0
 	github.com/araddon/dateparse v0.0.0-20210429162001-6b43995a97de
 	github.com/benhoyt/goawk v1.20.0
 	github.com/bits-and-blooms/bitset v1.2.1
 	github.com/chewxy/math32 v1.10.1
+	github.com/coreos/go-oidc/v3 v3.11.0
 	github.com/deckarep/golang-set/v2 v2.3.1
 	github.com/emicklei/go-restful-openapi/v2 v2.9.0
 	github.com/emicklei/go-restful/v3 v3.9.0
+	github.com/expr-lang/expr v1.16.9
 	github.com/fxtlabs/primes v0.0.0-20150821004651-dad82d10a449
-	github.com/go-playground/locales v0.14.0
-	github.com/go-playground/universal-translator v0.18.0
-	github.com/go-playground/validator/v10 v10.11.0
+	github.com/go-playground/locales v0.14.1
+	github.com/go-playground/universal-translator v0.18.1
+	github.com/go-playground/validator/v10 v10.22.1
 	github.com/go-resty/resty/v2 v2.7.0
 	github.com/go-sql-driver/mysql v1.6.0
-	github.com/golang/protobuf v1.5.2
+	github.com/go-viper/mapstructure/v2 v2.2.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/securecookie v1.1.1
-	github.com/gorse-io/dashboard v0.0.0-20241112140226-19a1b322242c
+	github.com/gorse-io/dashboard v0.0.0-20241219140402-1035820fbe77
 	github.com/haxii/go-swagger-ui v0.0.0-20210203093335-a63a6bbde946
 	github.com/jaswdr/faker v1.16.0
+	github.com/jellydator/ttlcache/v3 v3.3.0
 	github.com/json-iterator/go v1.1.12
 	github.com/juju/errors v1.0.0
 	github.com/klauspost/asmfmt v1.3.2
 	github.com/klauspost/cpuid/v2 v2.2.3
 	github.com/lafikl/consistent v0.0.0-20220512074542-bdd3606bfc3e
 	github.com/lib/pq v1.10.6
+	github.com/madflojo/testcerts v1.3.0
 	github.com/mailru/go-clickhouse/v2 v2.0.1-0.20221121001540-b259988ad8e5
-	github.com/mitchellh/mapstructure v1.5.0
 	github.com/orcaman/concurrent-map v1.0.0
 	github.com/prometheus/client_golang v1.13.0
 	github.com/rakyll/statik v0.1.7
@@ -63,7 +63,9 @@ require (
 	go.uber.org/atomic v1.10.0
 	go.uber.org/zap v1.24.0
 	golang.org/x/exp v0.0.0-20220722155223-a9213eeb770e
+	golang.org/x/oauth2 v0.22.0
 	google.golang.org/grpc v1.67.1
+	google.golang.org/grpc/security/advancedtls v1.0.0
 	google.golang.org/protobuf v1.35.1
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v2 v2.4.0
@@ -93,6 +95,8 @@ require (
 	github.com/dustin/go-humanize v1.0.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/fsnotify/fsnotify v1.5.4 // indirect
+	github.com/gabriel-vasile/mimetype v1.4.3 // indirect
+	github.com/go-jose/go-jose/v4 v4.0.2 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-openapi/jsonpointer v0.19.5 // indirect
@@ -100,6 +104,7 @@ require (
 	github.com/go-openapi/spec v0.20.7 // indirect
 	github.com/go-openapi/swag v0.22.3 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/flatbuffers v2.0.6+incompatible // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.22.0 // indirect
@@ -120,7 +125,7 @@ require (
 	github.com/kballard/go-shellquote v0.0.0-20180428030007-95032a82bc51 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/leesper/go_rng v0.0.0-20190531154944-a612b043e353 // indirect
-	github.com/leodido/go-urn v1.2.1 // indirect
+	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/magiconair/properties v1.8.6 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-isatty v0.0.16 // indirect
@@ -128,6 +133,7 @@ require (
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
 	github.com/minio/blake2b-simd v0.0.0-20160723061019-3f5f724cb5b1 // indirect
 	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
+	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/montanaflynn/stats v0.7.1 // indirect

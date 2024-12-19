@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,10 +32,10 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	restfulspec "github.com/emicklei/go-restful-openapi/v2"
 	"github.com/emicklei/go-restful/v3"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/gorilla/securecookie"
 	_ "github.com/gorse-io/dashboard"
 	"github.com/juju/errors"
-	"github.com/mitchellh/mapstructure"
 	"github.com/rakyll/statik/fs"
 	"github.com/samber/lo"
 	"github.com/zhenghaoz/gorse/base"
@@ -49,10 +50,24 @@ import (
 	"github.com/zhenghaoz/gorse/server"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
+	"github.com/zhenghaoz/gorse/storage/meta"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+type UserInfo struct {
+	Name       string `json:"name"`
+	FamilyName string `json:"family_name"`
+	GivenName  string `json:"given_name"`
+	MiddleName string `json:"middle_name"`
+	NickName   string `json:"nickname"`
+	Picture    string `json:"picture"`
+	UpdatedAt  string `json:"updated_at"`
+	Email      string `json:"email"`
+	Verified   bool   `json:"email_verified"`
+	AuthType   string `json:"auth_type"`
+}
 
 func (m *Master) CreateWebService() {
 	ws := m.WebService
@@ -60,11 +75,16 @@ func (m *Master) CreateWebService() {
 	ws.Path("/api/")
 	ws.Filter(m.LoginFilter)
 
+	ws.Route(ws.GET("/dashboard/userinfo").To(m.handleUserInfo).
+		Doc("Get login user information.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{"dashboard"}).
+		Returns(http.StatusOK, "OK", UserInfo{}).
+		Writes(UserInfo{}))
 	ws.Route(ws.GET("/dashboard/cluster").To(m.getCluster).
 		Doc("Get nodes in the cluster.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{"dashboard"}).
-		Returns(http.StatusOK, "OK", []Node{}).
-		Writes([]Node{}))
+		Returns(http.StatusOK, "OK", []meta.Node{}).
+		Writes([]meta.Node{}))
 	ws.Route(ws.GET("/dashboard/categories").To(m.getCategories).
 		Doc("Get categories of items.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{"dashboard"}).
@@ -117,38 +137,16 @@ func (m *Master) CreateWebService() {
 		Param(ws.QueryParameter("cursor", "cursor for next page").DataType("string")).
 		Returns(http.StatusOK, "OK", UserIterator{}).
 		Writes(UserIterator{}))
-	// Get popular items
-	ws.Route(ws.GET("/dashboard/popular/").To(m.getPopular).
-		Doc("get popular items").
+	// Get non-personalized recommendation
+	ws.Route(ws.GET("/non-personalized/{name}").To(m.getNonPersonalized).
+		Doc("Get non-personalized recommendations.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{"dashboard"}).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("int")).
-		Param(ws.QueryParameter("offset", "offset of the list").DataType("int")).
-		Returns(http.StatusOK, "OK", []ScoredItem{}).
-		Writes([]ScoredItem{}))
-	ws.Route(ws.GET("/dashboard/popular/{category}").To(m.getPopular).
-		Doc("get popular items").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"dashboard"}).
-		Param(ws.PathParameter("category", "category of items").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("int")).
-		Param(ws.QueryParameter("offset", "offset of the list").DataType("int")).
-		Returns(http.StatusOK, "OK", []ScoredItem{}).
-		Writes([]ScoredItem{}))
-	// Get latest items
-	ws.Route(ws.GET("/dashboard/latest/").To(m.getLatest).
-		Doc("get latest items").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"dashboard"}).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("int")).
-		Param(ws.QueryParameter("offset", "offset of the list").DataType("int")).
-		Returns(http.StatusOK, "OK", []ScoredItem{}).
-		Writes([]ScoredItem{}))
-	ws.Route(ws.GET("/dashboard/latest/{category}").To(m.getLatest).
-		Doc("get latest items").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"dashboard"}).
-		Param(ws.PathParameter("category", "category of items").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("int")).
-		Param(ws.QueryParameter("offset", "offset of the list").DataType("int")).
-		Returns(http.StatusOK, "OK", []ScoredItem{}).
-		Writes([]ScoredItem{}))
+		Param(ws.QueryParameter("category", "Category of returned items.").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned users").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned users").DataType("integer")).
+		Param(ws.QueryParameter("user-id", "Remove read items of a user").DataType("string")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	ws.Route(ws.GET("/dashboard/recommend/{user-id}").To(m.getRecommend).
 		Doc("Get recommendation for user.").
 		Metadata(restfulspec.KeyOpenAPITags, []string{"dashboard"}).
@@ -224,6 +222,7 @@ func (m *Master) StartHttpServer() {
 	container.Handle("/", http.HandlerFunc(m.dashboard))
 	container.Handle("/login", http.HandlerFunc(m.login))
 	container.Handle("/logout", http.HandlerFunc(m.logout))
+	container.Handle("/callback/oauth2", http.HandlerFunc(m.handleOAuth2Callback))
 	container.Handle("/api/purge", http.HandlerFunc(m.purge))
 	container.Handle("/api/bulk/users", http.HandlerFunc(m.importExportUsers))
 	container.Handle("/api/bulk/items", http.HandlerFunc(m.importExportItems))
@@ -309,8 +308,13 @@ func (m *Master) dashboard(response http.ResponseWriter, request *http.Request) 
 	_, err := staticFileSystem.Open(request.RequestURI)
 	if request.RequestURI == "/" || os.IsNotExist(err) {
 		if !m.checkLogin(request) {
-			http.Redirect(response, request, "/login", http.StatusFound)
-			log.Logger().Info(fmt.Sprintf("%s %s", request.Method, request.URL), zap.Int("status_code", http.StatusFound))
+			if m.Config.OIDC.Enable {
+				// Redirect to OIDC login
+				http.Redirect(response, request, m.oauth2Config.AuthCodeURL(""), http.StatusFound)
+			} else {
+				http.Redirect(response, request, "/login", http.StatusFound)
+				log.Logger().Info(fmt.Sprintf("%s %s", request.Method, request.URL), zap.Int("status_code", http.StatusFound))
+			}
 			return
 		}
 		noCache(staticFileServer).ServeHTTP(response, request)
@@ -319,59 +323,15 @@ func (m *Master) dashboard(response http.ResponseWriter, request *http.Request) 
 	staticFileServer.ServeHTTP(response, request)
 }
 
-func (m *Master) checkToken(token string) (bool, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/auth/dashboard/%s", m.Config.Master.DashboardAuthServer, token))
-	if err != nil {
-		return false, errors.Trace(err)
-	}
-	if resp.StatusCode == http.StatusOK {
-		return true, nil
-	} else if resp.StatusCode == http.StatusUnauthorized {
-		return false, nil
-	} else {
-		if message, err := io.ReadAll(resp.Body); err != nil {
-			return false, errors.Trace(err)
-		} else {
-			return false, errors.New(string(message))
-		}
-	}
-}
-
 func (m *Master) login(response http.ResponseWriter, request *http.Request) {
 	switch request.Method {
 	case http.MethodGet:
 		log.Logger().Info("GET /login", zap.Int("status_code", http.StatusOK))
 		staticFileServer.ServeHTTP(response, request)
 	case http.MethodPost:
-		token := request.FormValue("token")
 		name := request.FormValue("user_name")
 		pass := request.FormValue("password")
-		if m.Config.Master.DashboardAuthServer != "" {
-			// check access token
-			if isValid, err := m.checkToken(token); err != nil {
-				server.InternalServerError(restful.NewResponse(response), err)
-				return
-			} else if !isValid {
-				http.Redirect(response, request, "login?msg=incorrect", http.StatusFound)
-				log.Logger().Info("POST /login", zap.Int("status_code", http.StatusUnauthorized))
-				return
-			}
-			// save token to cache
-			if encoded, err := cookieHandler.Encode("token", token); err != nil {
-				server.InternalServerError(restful.NewResponse(response), err)
-				return
-			} else {
-				cookie := &http.Cookie{
-					Name:  "token",
-					Value: encoded,
-					Path:  "/",
-				}
-				http.SetCookie(response, cookie)
-				http.Redirect(response, request, "/", http.StatusFound)
-				log.Logger().Info("POST /login", zap.Int("status_code", http.StatusUnauthorized))
-				return
-			}
-		} else if m.Config.Master.DashboardUserName != "" || m.Config.Master.DashboardPassword != "" {
+		if m.Config.Master.DashboardUserName != "" || m.Config.Master.DashboardPassword != "" {
 			if name != m.Config.Master.DashboardUserName || pass != m.Config.Master.DashboardPassword {
 				http.Redirect(response, request, "login?msg=incorrect", http.StatusFound)
 				log.Logger().Info("POST /login", zap.Int("status_code", http.StatusUnauthorized))
@@ -433,13 +393,11 @@ func (m *Master) checkLogin(request *http.Request) bool {
 	if m.Config.Master.AdminAPIKey != "" && m.Config.Master.AdminAPIKey == request.Header.Get("X-Api-Key") {
 		return true
 	}
-	if m.Config.Master.DashboardAuthServer != "" {
-		if tokenCookie, err := request.Cookie("token"); err == nil {
+	if m.Config.OIDC.Enable {
+		if tokenCookie, err := request.Cookie("id_token"); err == nil {
 			var token string
-			if err = cookieHandler.Decode("token", tokenCookie.Value, &token); err == nil {
-				if isValid, err := m.checkToken(token); err != nil {
-					log.Logger().Error("failed to check access token", zap.Error(err))
-				} else if isValid {
+			if err = cookieHandler.Decode("id_token", tokenCookie.Value, &token); err == nil {
+				if m.tokenCache.Get(token) != nil {
 					return true
 				}
 			}
@@ -461,6 +419,26 @@ func (m *Master) checkLogin(request *http.Request) bool {
 	return true
 }
 
+func (m *Master) handleUserInfo(request *restful.Request, response *restful.Response) {
+	if m.Config.OIDC.Enable {
+		if tokenCookie, err := request.Request.Cookie("id_token"); err == nil {
+			var token string
+			if err = cookieHandler.Decode("id_token", tokenCookie.Value, &token); err == nil {
+				if item := m.tokenCache.Get(token); item != nil {
+					userInfo := item.Value()
+					userInfo.AuthType = "OIDC"
+					server.Ok(response, userInfo)
+					return
+				}
+			}
+		}
+	} else if m.Config.Master.DashboardUserName != "" {
+		server.Ok(response, UserInfo{
+			Name: m.Config.Master.DashboardUserName,
+		})
+	}
+}
+
 func (m *Master) getCategories(request *restful.Request, response *restful.Response) {
 	ctx := context.Background()
 	if request != nil && request.Request != nil {
@@ -475,23 +453,14 @@ func (m *Master) getCategories(request *restful.Request, response *restful.Respo
 }
 
 func (m *Master) getCluster(_ *restful.Request, response *restful.Response) {
-	// collect nodes
-	workers := make([]*Node, 0)
-	servers := make([]*Node, 0)
-	m.nodesInfoMutex.RLock()
-	for _, info := range m.nodesInfo {
-		switch info.Type {
-		case WorkerNode:
-			workers = append(workers, info)
-		case ServerNode:
-			servers = append(servers, info)
-		}
+	nodes, err := m.metaStore.ListNodes()
+	if err != nil {
+		server.InternalServerError(response, err)
+		return
 	}
-	m.nodesInfoMutex.RUnlock()
-	// return nodes
-	nodes := make([]*Node, 0)
-	nodes = append(nodes, workers...)
-	nodes = append(nodes, servers...)
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Type < nodes[j].Type
+	})
 	server.Ok(response, nodes)
 }
 
@@ -586,16 +555,19 @@ func (m *Master) getStats(request *restful.Request, response *restful.Response) 
 		log.ResponseLogger(response).Warn("failed to get number of valid negative feedbacks", zap.Error(err))
 	}
 	// count the number of workers and servers
-	m.nodesInfoMutex.Lock()
-	for _, node := range m.nodesInfo {
+	nodes, err := m.metaStore.ListNodes()
+	if err != nil {
+		server.InternalServerError(response, err)
+		return
+	}
+	for _, node := range nodes {
 		switch node.Type {
-		case ServerNode:
+		case protocol.NodeType_Server.String():
 			status.NumServers++
-		case WorkerNode:
+		case protocol.NodeType_Worker.String():
 			status.NumWorkers++
 		}
 	}
-	m.nodesInfoMutex.Unlock()
 	// read popular items update time
 	if status.PopularItemsUpdateTime, err = m.CacheClient.Get(ctx, cache.Key(cache.GlobalMeta, cache.LastUpdatePopularItemsTime)).Time(); err != nil {
 		log.ResponseLogger(response).Warn("failed to get popular items update time", zap.Error(err))
@@ -645,13 +617,16 @@ func (m *Master) getStats(request *restful.Request, response *restful.Response) 
 func (m *Master) getTasks(_ *restful.Request, response *restful.Response) {
 	// List workers
 	workers := mapset.NewSet[string]()
-	m.nodesInfoMutex.RLock()
-	for _, info := range m.nodesInfo {
-		if info.Type == WorkerNode {
-			workers.Add(info.Name)
+	nodes, err := m.metaStore.ListNodes()
+	if err != nil {
+		server.InternalServerError(response, err)
+		return
+	}
+	for _, node := range nodes {
+		if node.Type == protocol.NodeType_Worker.String() {
+			workers.Add(node.UUID)
 		}
 	}
-	m.nodesInfoMutex.RUnlock()
 	// List local progress
 	progressList := m.tracer.List()
 	// list remote progress
@@ -923,15 +898,10 @@ func (m *Master) searchDocuments(collection, subset, category string, request *r
 	}
 }
 
-// getPopular gets popular items from database.
-func (m *Master) getPopular(request *restful.Request, response *restful.Response) {
-	category := request.PathParameter("category")
-	m.searchDocuments(cache.PopularItems, "", category, request, response, data.Item{})
-}
-
-func (m *Master) getLatest(request *restful.Request, response *restful.Response) {
-	category := request.PathParameter("category")
-	m.searchDocuments(cache.LatestItems, "", category, request, response, data.Item{})
+func (m *Master) getNonPersonalized(request *restful.Request, response *restful.Response) {
+	name := request.PathParameter("name")
+	category := request.QueryParameter("category")
+	m.searchDocuments(cache.NonPersonalized, name, category, request, response, data.Item{})
 }
 
 func (m *Master) getItemNeighbors(request *restful.Request, response *restful.Response) {
@@ -1362,11 +1332,11 @@ func writeError(response http.ResponseWriter, httpStatus int, message string) {
 	}
 }
 
-func (s *Master) checkAdmin(request *http.Request) bool {
-	if s.Config.Master.AdminAPIKey == "" {
+func (m *Master) checkAdmin(request *http.Request) bool {
+	if m.Config.Master.AdminAPIKey == "" {
 		return true
 	}
-	if request.FormValue("X-API-Key") == s.Config.Master.AdminAPIKey {
+	if request.FormValue("X-API-Key") == m.Config.Master.AdminAPIKey {
 		return true
 	}
 	return false
@@ -1673,4 +1643,48 @@ func (m *Master) restore(response http.ResponseWriter, request *http.Request) {
 		zap.Int("feedback", stats.Feedback),
 		zap.Duration("duration", stats.Duration))
 	server.Ok(restful.NewResponse(response), stats)
+}
+
+func (m *Master) handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
+	// Verify state and errors.
+	oauth2Token, err := m.oauth2Config.Exchange(r.Context(), r.URL.Query().Get("code"))
+	if err != nil {
+		server.InternalServerError(restful.NewResponse(w), err)
+		return
+	}
+	// Extract the ID Token from OAuth2 token.
+	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
+	if !ok {
+		server.InternalServerError(restful.NewResponse(w), errors.New("missing id_token"))
+		return
+	}
+	// Parse and verify ID Token payload.
+	idToken, err := m.verifier.Verify(r.Context(), rawIDToken)
+	if err != nil {
+		server.InternalServerError(restful.NewResponse(w), err)
+		return
+	}
+	// Extract custom claims
+	var claims UserInfo
+	if err := idToken.Claims(&claims); err != nil {
+		server.InternalServerError(restful.NewResponse(w), err)
+		return
+	}
+	// Set token cache and cookie
+	m.tokenCache.Set(rawIDToken, claims, time.Until(idToken.Expiry))
+	if encoded, err := cookieHandler.Encode("id_token", rawIDToken); err != nil {
+		server.InternalServerError(restful.NewResponse(w), err)
+		return
+	} else {
+		http.SetCookie(w, &http.Cookie{
+			Name:    "id_token",
+			Value:   encoded,
+			Path:    "/",
+			Expires: idToken.Expiry,
+		})
+		http.Redirect(w, r, "/", http.StatusFound)
+		log.Logger().Info("login success via OIDC",
+			zap.String("name", claims.Name),
+			zap.String("email", claims.Email))
+	}
 }

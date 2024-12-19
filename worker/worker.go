@@ -21,11 +21,13 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/google/uuid"
 	"github.com/juju/errors"
 	"github.com/lafikl/consistent"
 	cmap "github.com/orcaman/concurrent-map"
@@ -45,6 +47,7 @@ import (
 	"github.com/zhenghaoz/gorse/model/click"
 	"github.com/zhenghaoz/gorse/model/ranking"
 	"github.com/zhenghaoz/gorse/protocol"
+	"github.com/zhenghaoz/gorse/storage"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
 	"go.uber.org/atomic"
@@ -82,6 +85,7 @@ type Worker struct {
 	httpPort   int
 	masterHost string
 	masterPort int
+	tlsConfig  *protocol.TLSConfig
 	cacheFile  string
 
 	// database connection path
@@ -91,6 +95,7 @@ type Worker struct {
 	dataPrefix  string
 
 	// master connection
+	conn         *grpc.ClientConn
 	masterClient protocol.MasterClient
 
 	latestRankingModelVersion int64
@@ -114,7 +119,16 @@ type Worker struct {
 }
 
 // NewWorker creates a new worker node.
-func NewWorker(masterHost string, masterPort int, httpHost string, httpPort, jobs int, cacheFile string, managedMode bool) *Worker {
+func NewWorker(
+	masterHost string,
+	masterPort int,
+	httpHost string,
+	httpPort int,
+	jobs int,
+	cacheFile string,
+	managedMode bool,
+	tlsConfig *protocol.TLSConfig,
+) *Worker {
 	return &Worker{
 		rankers:       make([]click.FactorizationMachine, jobs),
 		managedMode:   managedMode,
@@ -124,6 +138,7 @@ func NewWorker(masterHost string, masterPort int, httpHost string, httpPort, job
 		cacheFile:  cacheFile,
 		masterHost: masterHost,
 		masterPort: masterPort,
+		tlsConfig:  tlsConfig,
 		httpHost:   httpHost,
 		httpPort:   httpPort,
 		jobs:       jobs,
@@ -150,10 +165,10 @@ func (w *Worker) Sync() {
 		var err error
 		if meta, err = w.masterClient.GetMeta(context.Background(),
 			&protocol.NodeInfo{
-				NodeType:      protocol.NodeType_WorkerNode,
-				NodeName:      w.workerName,
-				HttpPort:      int64(w.httpPort),
+				NodeType:      protocol.NodeType_Worker,
+				Uuid:          w.workerName,
 				BinaryVersion: version.Version,
+				Hostname:      lo.Must(os.Hostname()),
 			}); err != nil {
 			log.Logger().Error("failed to get meta", zap.Error(err))
 			goto sleep
@@ -177,11 +192,16 @@ func (w *Worker) Sync() {
 
 		// connect to data store
 		if w.dataPath != w.Config.Database.DataStore || w.dataPrefix != w.Config.Database.DataTablePrefix {
-			log.Logger().Info("connect data store",
-				zap.String("database", log.RedactDBURL(w.Config.Database.DataStore)))
-			if w.DataClient, err = data.Open(w.Config.Database.DataStore, w.Config.Database.DataTablePrefix); err != nil {
-				log.Logger().Error("failed to connect data store", zap.Error(err))
-				goto sleep
+			if strings.HasPrefix(w.Config.Database.DataStore, storage.SQLitePrefix) {
+				log.Logger().Info("connect data store via master")
+				w.DataClient = data.NewProxyClient(w.conn)
+			} else {
+				log.Logger().Info("connect data store",
+					zap.String("database", log.RedactDBURL(w.Config.Database.DataStore)))
+				if w.DataClient, err = data.Open(w.Config.Database.DataStore, w.Config.Database.DataTablePrefix); err != nil {
+					log.Logger().Error("failed to connect data store", zap.Error(err))
+					goto sleep
+				}
 			}
 			w.dataPath = w.Config.Database.DataStore
 			w.dataPrefix = w.Config.Database.DataTablePrefix
@@ -189,11 +209,16 @@ func (w *Worker) Sync() {
 
 		// connect to cache store
 		if w.cachePath != w.Config.Database.CacheStore || w.cachePrefix != w.Config.Database.CacheTablePrefix {
-			log.Logger().Info("connect cache store",
-				zap.String("database", log.RedactDBURL(w.Config.Database.CacheStore)))
-			if w.CacheClient, err = cache.Open(w.Config.Database.CacheStore, w.Config.Database.CacheTablePrefix); err != nil {
-				log.Logger().Error("failed to connect cache store", zap.Error(err))
-				goto sleep
+			if strings.HasPrefix(w.Config.Database.CacheStore, storage.SQLitePrefix) {
+				log.Logger().Info("connect cache store via master")
+				w.CacheClient = cache.NewProxyClient(w.conn)
+			} else {
+				log.Logger().Info("connect cache store",
+					zap.String("database", log.RedactDBURL(w.Config.Database.CacheStore)))
+				if w.CacheClient, err = cache.Open(w.Config.Database.CacheStore, w.Config.Database.CacheTablePrefix); err != nil {
+					log.Logger().Error("failed to connect cache store", zap.Error(err))
+					goto sleep
+				}
 			}
 			w.cachePath = w.Config.Database.CacheStore
 			w.cachePrefix = w.Config.Database.CacheTablePrefix
@@ -372,7 +397,7 @@ func (w *Worker) Serve() {
 			}
 		}
 		if state.WorkerName == "" {
-			state.WorkerName = base.GetRandomName(0)
+			state.WorkerName = uuid.New().String()
 			err = state.WriteLocalCache()
 			if err != nil {
 				log.Logger().Fatal("failed to write meta", zap.Error(err))
@@ -389,11 +414,22 @@ func (w *Worker) Serve() {
 	w.tracer = progress.NewTracer(w.workerName)
 
 	// connect to master
-	conn, err := grpc.Dial(fmt.Sprintf("%v:%v", w.masterHost, w.masterPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var opts []grpc.DialOption
+	if w.tlsConfig != nil {
+		c, err := protocol.NewClientCreds(w.tlsConfig)
+		if err != nil {
+			log.Logger().Fatal("failed to create credentials", zap.Error(err))
+		}
+		opts = append(opts, grpc.WithTransportCredentials(c))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	var err error
+	w.conn, err = grpc.Dial(fmt.Sprintf("%v:%v", w.masterHost, w.masterPort), opts...)
 	if err != nil {
 		log.Logger().Fatal("failed to connect master", zap.Error(err))
 	}
-	w.masterClient = protocol.NewMasterClient(conn)
+	w.masterClient = protocol.NewMasterClient(w.conn)
 
 	if w.oneMode {
 		w.peers = []string{w.workerName}
@@ -715,7 +751,7 @@ func (w *Worker) Recommend(users []data.User) {
 		if w.Config.Recommend.Offline.EnableLatestRecommend {
 			localStartTime := time.Now()
 			for _, category := range append([]string{""}, itemCategories...) {
-				latestItems, err := w.CacheClient.SearchScores(ctx, cache.LatestItems, "", []string{category}, 0, w.Config.Recommend.CacheSize)
+				latestItems, err := w.CacheClient.SearchScores(ctx, cache.NonPersonalized, cache.Latest, []string{category}, 0, w.Config.Recommend.CacheSize)
 				if err != nil {
 					log.Logger().Error("failed to load latest items", zap.Error(err))
 					return errors.Trace(err)
@@ -735,7 +771,7 @@ func (w *Worker) Recommend(users []data.User) {
 		if w.Config.Recommend.Offline.EnablePopularRecommend {
 			localStartTime := time.Now()
 			for _, category := range append([]string{""}, itemCategories...) {
-				popularItems, err := w.CacheClient.SearchScores(ctx, cache.PopularItems, "", []string{category}, 0, w.Config.Recommend.CacheSize)
+				popularItems, err := w.CacheClient.SearchScores(ctx, cache.NonPersonalized, cache.Popular, []string{category}, 0, w.Config.Recommend.CacheSize)
 				if err != nil {
 					log.Logger().Error("failed to load popular items", zap.Error(err))
 					return errors.Trace(err)
@@ -1024,12 +1060,12 @@ func (w *Worker) exploreRecommend(exploitRecommend []cache.Score, excludeSet map
 		exploreLatestThreshold += threshold
 	}
 	// load popular items
-	popularItems, err := w.CacheClient.SearchScores(ctx, cache.PopularItems, "", []string{category}, 0, w.Config.Recommend.CacheSize)
+	popularItems, err := w.CacheClient.SearchScores(ctx, cache.NonPersonalized, cache.Popular, []string{category}, 0, w.Config.Recommend.CacheSize)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	// load the latest items
-	latestItems, err := w.CacheClient.SearchScores(ctx, cache.LatestItems, "", []string{category}, 0, w.Config.Recommend.CacheSize)
+	latestItems, err := w.CacheClient.SearchScores(ctx, cache.NonPersonalized, cache.Latest, []string{category}, 0, w.Config.Recommend.CacheSize)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}

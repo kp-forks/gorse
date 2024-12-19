@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -29,17 +28,19 @@ import (
 	"time"
 
 	"github.com/emicklei/go-restful/v3"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/juju/errors"
-	"github.com/mitchellh/mapstructure"
 	"github.com/samber/lo"
 	"github.com/steinfletcher/apitest"
 	"github.com/stretchr/testify/assert"
 	"github.com/zhenghaoz/gorse/config"
 	"github.com/zhenghaoz/gorse/model/click"
 	"github.com/zhenghaoz/gorse/model/ranking"
+	"github.com/zhenghaoz/gorse/protocol"
 	"github.com/zhenghaoz/gorse/server"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
+	"github.com/zhenghaoz/gorse/storage/meta"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -58,11 +59,15 @@ func newMockServer(t *testing.T) (*mockServer, string) {
 	// open database
 	var err error
 	s.Settings = config.NewSettings()
+	s.metaStore, err = meta.Open(fmt.Sprintf("sqlite://%s/meta.db", t.TempDir()), s.Config.Master.MetaTimeout)
+	assert.NoError(t, err)
 	s.DataClient, err = data.Open(fmt.Sprintf("sqlite://%s/data.db", t.TempDir()), "")
 	assert.NoError(t, err)
 	s.CacheClient, err = cache.Open(fmt.Sprintf("sqlite://%s/cache.db", t.TempDir()), "")
 	assert.NoError(t, err)
 	// init database
+	err = s.metaStore.Init()
+	assert.NoError(t, err)
 	err = s.DataClient.Init()
 	assert.NoError(t, err)
 	err = s.CacheClient.Init()
@@ -89,7 +94,9 @@ func newMockServer(t *testing.T) (*mockServer, string) {
 }
 
 func (s *mockServer) Close(t *testing.T) {
-	err := s.DataClient.Close()
+	err := s.metaStore.Close()
+	assert.NoError(t, err)
+	err = s.DataClient.Close()
 	assert.NoError(t, err)
 	err = s.CacheClient.Close()
 	assert.NoError(t, err)
@@ -329,11 +336,24 @@ func TestMaster_GetCluster(t *testing.T) {
 	s, cookie := newMockServer(t)
 	defer s.Close(t)
 	// add nodes
-	serverNode := &Node{"alan turnin", ServerNode, "192.168.1.100", 1080, "server_version"}
-	workerNode := &Node{"dennis ritchie", WorkerNode, "192.168.1.101", 1081, "worker_version"}
-	s.nodesInfo = make(map[string]*Node)
-	s.nodesInfo["alan turning"] = serverNode
-	s.nodesInfo["dennis ritchie"] = workerNode
+	serverNode := &meta.Node{
+		UUID:       "alan turnin",
+		Hostname:   "192.168.1.100",
+		Type:       protocol.NodeType_Server.String(),
+		Version:    "server_version",
+		UpdateTime: time.Now().UTC(),
+	}
+	workerNode := &meta.Node{
+		UUID:       "dennis ritchie",
+		Hostname:   "192.168.1.101",
+		Type:       protocol.NodeType_Worker.String(),
+		Version:    "worker_version",
+		UpdateTime: time.Now().UTC(),
+	}
+	err := s.metaStore.UpdateNode(serverNode)
+	assert.NoError(t, err)
+	err = s.metaStore.UpdateNode(workerNode)
+	assert.NoError(t, err)
 	// get nodes
 	apitest.New().
 		Handler(s.handler).
@@ -341,7 +361,7 @@ func TestMaster_GetCluster(t *testing.T) {
 		Header("Cookie", cookie).
 		Expect(t).
 		Status(http.StatusOK).
-		Body(marshal(t, []*Node{workerNode, serverNode})).
+		Body(marshal(t, []*meta.Node{serverNode, workerNode})).
 		End()
 }
 
@@ -495,10 +515,10 @@ func TestServer_SearchDocumentsOfItems(t *testing.T) {
 	operators := []ListOperator{
 		{"Item Neighbors", cache.ItemNeighbors, "0", "", "/api/dashboard/item/0/neighbors"},
 		{"Item Neighbors in Category", cache.ItemNeighbors, "0", "*", "/api/dashboard/item/0/neighbors/*"},
-		{"Latest Items", cache.LatestItems, "", "", "/api/dashboard/latest/"},
-		{"Popular Items", cache.PopularItems, "", "", "/api/dashboard/popular/"},
-		{"Latest Items in Category", cache.LatestItems, "", "*", "/api/dashboard/latest/*"},
-		{"Popular Items in Category", cache.PopularItems, "", "*", "/api/dashboard/popular/*"},
+		{"Latest Items", cache.NonPersonalized, cache.Latest, "", "/api/non-personalized/latest/"},
+		{"Popular Items", cache.NonPersonalized, cache.Popular, "", "/api/non-personalized/popular/"},
+		{"Latest Items in Category", cache.NonPersonalized, cache.Latest, "*", "/api/non-personalized/latest/"},
+		{"Popular Items in Category", cache.NonPersonalized, cache.Popular, "*", "/api/non-personalized/popular/"},
 	}
 	for i, operator := range operators {
 		t.Run(operator.Name, func(t *testing.T) {
@@ -531,6 +551,7 @@ func TestServer_SearchDocumentsOfItems(t *testing.T) {
 				Handler(s.handler).
 				Get(operator.Get).
 				Header("Cookie", cookie).
+				Query("category", operator.Category).
 				Expect(t).
 				Status(http.StatusOK).
 				Body(marshal(t, []ScoredItem{items[0], items[1], items[2], items[4]})).
@@ -762,88 +783,6 @@ func TestMaster_GetConfig(t *testing.T) {
 		Expect(t).
 		Status(http.StatusOK).
 		Body(marshal(t, redactedConfig)).
-		End()
-}
-
-type mockAuthServer struct {
-	token string
-	srv   *http.Server
-	ln    net.Listener
-}
-
-func NewMockAuthServer(token string) *mockAuthServer {
-	return &mockAuthServer{token: token}
-}
-
-func (m *mockAuthServer) auth(request *restful.Request, response *restful.Response) {
-	token := request.PathParameter("token")
-	if token == m.token {
-		response.WriteHeader(http.StatusOK)
-	} else {
-		response.WriteHeader(http.StatusUnauthorized)
-	}
-}
-
-func (m *mockAuthServer) Start(t *testing.T) {
-	ws := new(restful.WebService)
-	ws.Route(ws.GET("/auth/dashboard/{token}").To(m.auth))
-	ct := restful.NewContainer()
-	ct.Add(ws)
-	m.srv = &http.Server{Handler: ct}
-	var err error
-	m.ln, err = net.Listen("tcp", "")
-	assert.NoError(t, err)
-	go func() {
-		if err = m.srv.Serve(m.ln); err != http.ErrServerClosed {
-			assert.NoError(t, err)
-		}
-	}()
-}
-
-func (m *mockAuthServer) Close(t *testing.T) {
-	err := m.srv.Close()
-	assert.NoError(t, err)
-}
-
-func (m *mockAuthServer) Addr() string {
-	return m.ln.Addr().String()
-}
-
-func TestMaster_TokenLogin(t *testing.T) {
-	s, _ := newMockServer(t)
-	defer s.Close(t)
-
-	// start auth server
-	authServer := NewMockAuthServer("abc")
-	authServer.Start(t)
-	defer authServer.Close(t)
-	s.Config.Master.DashboardAuthServer = fmt.Sprintf("http://%s", authServer.Addr())
-
-	// login fail
-	req := httptest.NewRequest("POST", "https://example.com/",
-		strings.NewReader("token=123"))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w := httptest.NewRecorder()
-	s.login(w, req)
-	assert.Equal(t, http.StatusFound, w.Code)
-	assert.Empty(t, w.Result().Cookies())
-
-	// login success
-	req = httptest.NewRequest("POST", "https://example.com/",
-		strings.NewReader("token=abc"))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w = httptest.NewRecorder()
-	s.login(w, req)
-	assert.Equal(t, http.StatusFound, w.Code)
-	assert.NotEmpty(t, w.Header().Get("Set-Cookie"))
-
-	// validate cookie
-	apitest.New().
-		Handler(s.handler).
-		Get("/api/dashboard/config").
-		Header("Cookie", w.Header().Get("Set-Cookie")).
-		Expect(t).
-		Status(http.StatusOK).
 		End()
 }
 
