@@ -16,6 +16,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sort"
 	"strconv"
@@ -76,15 +77,9 @@ const (
 	//	Recommendation digest      - offline_recommend_digest/{user_id}
 	OfflineRecommendDigest = "offline_recommend_digest"
 
-	// PopularItems is sorted set of popular items. The format of key:
-	//  Global popular items      - latest_items
-	//  Categorized popular items - latest_items/{category}
-	PopularItems = "popular_items"
-
-	// LatestItems is sorted set of the latest items. The format of key:
-	//  Global latest items      - latest_items
-	//  Categorized the latest items - latest_items/{category}
-	LatestItems = "latest_items"
+	NonPersonalized = "non-personalized"
+	Latest          = "latest"
+	Popular         = "popular"
 
 	// ItemCategories is the set of item categories. The format of key:
 	//	Global item categories - item_categories
@@ -115,7 +110,7 @@ const (
 	MatchingIndexRecall        = "matching_index_recall"
 )
 
-var ItemCache = []string{PopularItems, LatestItems, ItemNeighbors, OfflineRecommend}
+var ItemCache = []string{NonPersonalized, ItemNeighbors, OfflineRecommend}
 
 var (
 	ErrObjectNotExist = errors.NotFoundf("object")
@@ -293,14 +288,14 @@ type Database interface {
 	AddScores(ctx context.Context, collection, subset string, documents []Score) error
 	SearchScores(ctx context.Context, collection, subset string, query []string, begin, end int) ([]Score, error)
 	DeleteScores(ctx context.Context, collection []string, condition ScoreCondition) error
-	UpdateScores(ctx context.Context, collection []string, id string, patch ScorePatch) error
+	UpdateScores(ctx context.Context, collections []string, subset *string, id string, patch ScorePatch) error
 
 	AddTimeSeriesPoints(ctx context.Context, points []TimeSeriesPoint) error
 	GetTimeSeriesPoints(ctx context.Context, name string, begin, end time.Time) ([]TimeSeriesPoint, error)
 }
 
 // Open a connection to a database.
-func Open(path, tablePrefix string) (Database, error) {
+func Open(path, tablePrefix string, opts ...storage.Option) (Database, error) {
 	var err error
 	if strings.HasPrefix(path, storage.RedisPrefix) || strings.HasPrefix(path, storage.RedissPrefix) {
 		opt, err := redis.ParseURL(path)
@@ -350,6 +345,7 @@ func Open(path, tablePrefix string) (Database, error) {
 		return database, nil
 	} else if strings.HasPrefix(path, storage.MySQLPrefix) {
 		name := path[len(storage.MySQLPrefix):]
+		option := storage.NewOptions(opts...)
 		// probe isolation variable name
 		isolationVarName, err := storage.ProbeMySQLIsolationVariableName(name)
 		if err != nil {
@@ -357,7 +353,7 @@ func Open(path, tablePrefix string) (Database, error) {
 		}
 		// append parameters
 		if name, err = storage.AppendMySQLParams(name, map[string]string{
-			isolationVarName: "'READ-UNCOMMITTED'",
+			isolationVarName: fmt.Sprintf("'%s'", option.IsolationLevel),
 			"parseTime":      "true",
 		}); err != nil {
 			return nil, errors.Trace(err)
